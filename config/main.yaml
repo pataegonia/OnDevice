@@ -51,6 +51,9 @@ train:
   depth_mode: null
   extended_visualization: false
   print_log_every_n_steps: 1
+  lmbda: 3.0  # rate weight; tied to the rate_loss denominator, see model_wrapper.py
+  skip_loss_above: null  # spike guard: drop a batch whose loss exceeds this; null = off
+  max_consecutive_skips: 64  # stop the run after this many dropped batches in a row
 
 test:
   output_path: outputs/test
@@ -58,6 +61,7 @@ test:
   eval_time_skip_steps: 0
   save_image: true
   save_video: false
+  compress: false  # true: encode to a real bitstream and decode from it
 
 seed: 111123
 

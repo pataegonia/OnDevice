@@ -56,6 +56,7 @@ class TestCfg:
     save_image: bool
     save_video: bool
     eval_time_skip_steps: int
+    compress: bool = False
 
 
 @dataclass
@@ -63,6 +64,31 @@ class TrainCfg:
     depth_mode: DepthRenderingMode | None
     extended_visualization: bool
     print_log_every_n_steps: int
+    lmbda: float
+    # Drop a batch whose loss exceeds this instead of backpropagating it. None = off.
+    skip_loss_above: float | None = None
+    # If this many batches in a row are dropped, the model has diverged: stop the run
+    # instead of idling on the GPU with every batch skipped.
+    max_consecutive_skips: int = 64
+
+
+def rate_denominator(harmonics_shape) -> int:
+    """Number of scalars the uncompressed 3DGS representation would store.
+
+    NOTE: rates divided by this are not image bpp. The denominator counts the SH
+    coefficients plus scales(3) + rotations(4) + means(3) + opacity(1) of every
+    Gaussian, so the value is not comparable to an image codec's bpp, and lmbda is
+    tied to this definition. It also scales with sh_degree: 59 per Gaussian at
+    sh_degree 3, 86 at sh_degree 4.
+    """
+    n, k, c, l = harmonics_shape
+    return n * k * (c * l + 3 + 4 + 3 + 1)
+
+
+def rate_loss(estimated_bits: dict, harmonics_shape) -> Tensor:
+    """Estimated bits per scalar of the uncompressed 3DGS representation."""
+    num_values = rate_denominator(harmonics_shape)
+    return sum(bits / num_values for bits in estimated_bits.values())
 
 
 @runtime_checkable
@@ -87,6 +113,10 @@ class ModelWrapper(LightningModule):
     test_cfg: TestCfg
     train_cfg: TrainCfg
     step_tracker: StepTracker | None
+
+    # Allow checkpoint mismatch: a base checkpoint has no codec weights, and a codec
+    # checkpoint carries keys for modules that are not ported here.
+    strict_loading: bool = False
 
     def __init__(
         self,
@@ -118,16 +148,17 @@ class ModelWrapper(LightningModule):
 
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
-            self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+            self.time_skip_steps_dict = {"encoder": 0, "decoder": 0, "decompress": 0}
 
     def training_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
         _, _, _, h, w = batch["target"]["image"].shape
 
         # Run the model.
-        gaussians = self.encoder(
+        enc_outputs = self.encoder(
             batch["context"], self.global_step, False, scene_names=batch["scene"]
         )
+        gaussians = enc_outputs["gaussians"]
         output = self.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],
@@ -152,6 +183,13 @@ class ModelWrapper(LightningModule):
             loss = loss_fn.forward(output, batch, gaussians, self.global_step)
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
+
+        # Rate-distortion: add the estimated bitrate of the feature codec.
+        bpp = None
+        if enc_outputs["estimated_bits"] is not None:
+            bpp = rate_loss(enc_outputs["estimated_bits"], gaussians.harmonics.shape)
+            self.log("loss/bpp", bpp)
+            total_loss = total_loss + self.train_cfg.lmbda * bpp
         self.log("loss/total", total_loss)
 
         if (
@@ -165,6 +203,9 @@ class ModelWrapper(LightningModule):
                 f"bound = [{batch['context']['near'].detach().cpu().numpy().mean()} "
                 f"{batch['context']['far'].detach().cpu().numpy().mean()}]; "
                 f"loss = {total_loss:.6f}"
+                # LocalLogger.log_metrics is a no-op, so self.log("loss/bpp") is
+                # invisible without wandb; print it where it can actually be read.
+                + ("" if bpp is None else f"; bpp = {bpp:.6f}")
             )
         self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean())
         self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean())
@@ -174,20 +215,113 @@ class ModelWrapper(LightningModule):
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
 
+        # One blown-up batch (loss in the hundreds, seen around step 7k-12k in several
+        # codec runs) was enough to collapse the whole model to a constant render, and
+        # norm clipping does not help because the direction itself is garbage. Skip it.
+        limit = self.train_cfg.skip_loss_above
+        if limit is not None:
+            # Under DDP every rank must take the same branch: a rank that skipped its
+            # backward would leave the others waiting in the gradient all-reduce.
+            bad = torch.tensor(
+                float(not torch.isfinite(total_loss) or total_loss > limit),
+                device=self.device,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(bad)
+            if bad.item() > 0:
+                self._consecutive_skips = getattr(self, "_consecutive_skips", 0) + 1
+                print(
+                    f"train step {self.global_step}; loss = {float(total_loss):.4g}; "
+                    f"a batch on some rank exceeded {limit}, skipping this batch "
+                    f"({self._consecutive_skips} in a row)"
+                )
+                if self._consecutive_skips >= self.train_cfg.max_consecutive_skips:
+                    raise RuntimeError(
+                        f"{self._consecutive_skips} consecutive batches above "
+                        f"skip_loss_above={limit}: the model has diverged, stopping."
+                    )
+                # A zero loss tied to every parameter instead of None: the batch adds
+                # nothing to the gradient, yet backward and the DDP all-reduce still run
+                # on every rank, so replicas neither hang nor drift apart.
+                return sum(p.sum() for p in self.parameters() if p.requires_grad) * 0.0
+            self._consecutive_skips = 0
+
         return total_loss
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        # Resuming restores the optimizer's saved lr schedule. Rescale the whole schedule
+        # so its peak becomes optimizer.lr from the config, so a run that keeps diverging
+        # can continue at a lower rate. Lightning restores the optimizer from this same
+        # dict afterwards, so editing it suffices.
+        target = self.optimizer_cfg.lr
+        ratios = []
+        for state in checkpoint.get("optimizer_states", []):
+            for group in state["param_groups"]:
+                # The peak lives in max_lr under OneCycleLR (cosine_lr) and in
+                # initial_lr under the LinearLR warm-up.
+                peak = group.get("max_lr", group.get("initial_lr", group["lr"]))
+                ratio = target / peak
+                ratios.append(ratio)
+                for key in ("lr", "initial_lr", "max_lr", "min_lr"):
+                    if key in group:
+                        group[key] *= ratio
+        for scheduler in checkpoint.get("lr_schedulers", []):
+            for key in ("base_lrs", "_last_lr"):
+                if key in scheduler:
+                    scheduler[key] = [v * r for v, r in zip(scheduler[key], ratios)]
+        if ratios:
+            print(f"resume: lr schedule rescaled by {ratios[0]:.3g} to peak {target}")
+
+    def on_test_start(self) -> None:
+        # Build the CDF tables the range coder needs. MeanScaleHyperpriorBase.compress
+        # does not do this itself, and calling it without update() raises at runtime.
+        codec = getattr(self.encoder, "gauss_feature_codec", None)
+        if codec is not None:
+            codec.update()
 
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
+        (scene,) = batch["scene"]
+        name = get_cfg()["wandb"]["name"]
+        path = self.test_cfg.output_path / name
+
         # Render Gaussians.
-        with self.benchmarker.time("encoder"):
-            gaussians = self.encoder(
-                batch["context"],
-                self.global_step,
-                deterministic=False,
+        codec = getattr(self.encoder, "gauss_feature_codec", None)
+        estimated_bits = None
+        bitstream_bytes = codec_bytes = None
+        if self.test_cfg.compress and codec is not None:
+            # Real bitstream: encode to a file, then decode from that file only. Going
+            # through the file is what keeps the decoder from quietly reading an
+            # encoder-side tensor.
+            from .encoder.compression.ops import (
+                read_nfcgs_bitstream,
+                write_nfcgs_bitstream,
             )
+
+            with self.benchmarker.time("encoder"):
+                payload = self.encoder.compress(batch["context"], self.global_step)
+            bitstream_path = path / "bitstream" / f"{scene}.bin"
+            bitstream_bytes = write_nfcgs_bitstream(bitstream_path, **payload)
+            codec_bytes = sum(
+                len(s) for group in payload["codec_out"]["strings"] for s in group
+            )
+            del payload
+            with self.benchmarker.time("decompress"):
+                gaussians = self.encoder.decompress(
+                    **read_nfcgs_bitstream(bitstream_path, device=self.device)
+                )
+        else:
+            with self.benchmarker.time("encoder"):
+                enc_outputs = self.encoder(
+                    batch["context"],
+                    self.global_step,
+                    deterministic=False,
+                )
+            gaussians = enc_outputs["gaussians"]
+            estimated_bits = enc_outputs["estimated_bits"]
         with self.benchmarker.time("decoder", num_calls=v):
             output = self.decoder.forward(
                 gaussians,
@@ -199,9 +333,6 @@ class ModelWrapper(LightningModule):
                 depth_mode=None,
             )
 
-        (scene,) = batch["scene"]
-        name = get_cfg()["wandb"]["name"]
-        path = self.test_cfg.output_path / name
         images_prob = output.color[0]
         rgb_gt = batch["target"]["image"][0]
 
@@ -231,6 +362,31 @@ class ModelWrapper(LightningModule):
                 self.test_step_outputs[f"ssim"] = []
             if f"lpips" not in self.test_step_outputs:
                 self.test_step_outputs[f"lpips"] = []
+
+            # Rate, so that a test run yields a whole R-D point rather than just the
+            # distortion half.
+            denominator = rate_denominator(gaussians.harmonics.shape)
+            if estimated_bits is not None:
+                # What the training loss optimises, not the size of a real bitstream.
+                self.test_step_outputs.setdefault("bpp", []).append(
+                    rate_loss(estimated_bits, gaussians.harmonics.shape).item()
+                )
+            if bitstream_bytes is not None:
+                # codec_*: the y/z streams alone, comparable to the estimated bpp.
+                # bitstream_*: the whole file, which also carries the camera
+                # parameters and shapes the decoder needs.
+                self.test_step_outputs.setdefault("codec_bpp", []).append(
+                    codec_bytes * 8 / denominator
+                )
+                self.test_step_outputs.setdefault("codec_kib", []).append(
+                    codec_bytes / 1024
+                )
+                self.test_step_outputs.setdefault("bitstream_bpp", []).append(
+                    bitstream_bytes * 8 / denominator
+                )
+                self.test_step_outputs.setdefault("bitstream_kib", []).append(
+                    bitstream_bytes / 1024
+                )
 
             self.test_step_outputs[f"psnr"].append(
                 compute_psnr(rgb_gt, rgb).mean().item()
@@ -294,7 +450,7 @@ class ModelWrapper(LightningModule):
             batch["context"],
             self.global_step,
             deterministic=False,
-        )
+        )["gaussians"]
         output_softmax = self.decoder.forward(
             gaussians_softmax,
             batch["target"]["extrinsics"],
@@ -469,7 +625,9 @@ class ModelWrapper(LightningModule):
         loop_reverse: bool = True,
     ) -> None:
         # Render probabilistic estimate of scene.
-        gaussians_prob = self.encoder(batch["context"], self.global_step, False)
+        gaussians_prob = self.encoder(batch["context"], self.global_step, False)[
+            "gaussians"
+        ]
         # gaussians_det = self.encoder(batch["context"], self.global_step, True)
 
         t = torch.linspace(0, 1, num_frames, dtype=torch.float32, device=self.device)
@@ -519,23 +677,22 @@ class ModelWrapper(LightningModule):
         video = (video.clip(min=0, max=1) * 255).type(torch.uint8).cpu().numpy()
         if loop_reverse:
             video = pack([video, video[::-1][1:-1]], "* c h w")[0]
-        visualizations = {
-            f"video/{name}": wandb.Video(video[None], fps=30, format="mp4")
-        }
+        fps = 30
+        key = f"video/{name}"
 
         # Since the PyTorch Lightning doesn't support video logging, log to wandb directly.
         try:
-            wandb.log(visualizations)
+            wandb.log({key: wandb.Video(video[None], fps=fps, format="mp4")})
         except Exception:
             assert isinstance(self.logger, LocalLogger)
-            for key, value in visualizations.items():
-                tensor = value._prepare_video(value.data)
-                clip = mpy.ImageSequenceClip(list(tensor), fps=value._fps)
-                dir = LOG_PATH / key
-                dir.mkdir(exist_ok=True, parents=True)
-                clip.write_videofile(
-                    str(dir / f"{self.global_step:0>6}.mp4"), logger=None
-                )
+            # Build the clip straight from the array: wandb.Video's _prepare_video and
+            # _fps are private and are not present in every wandb version.
+            clip = mpy.ImageSequenceClip(list(video.transpose(0, 2, 3, 1)), fps=fps)
+            dir = LOG_PATH / key
+            dir.mkdir(exist_ok=True, parents=True)
+            clip.write_videofile(
+                str(dir / f"{self.global_step:0>6}.mp4"), logger=None
+            )
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.optimizer_cfg.lr)

@@ -36,6 +36,38 @@ def cyan(text: str) -> str:
     return f"{Fore.CYAN}{text}{Fore.RESET}"
 
 
+def load_checkpoint_weights(model, checkpoint_path, max_shown: int = 15) -> None:
+    """Load model weights only (no optimizer state) and log which keys did not line up.
+
+    Loading is non-strict so that a base checkpoint without codec weights still works.
+    Keys whose shape differs from the current model (to_gaussians.0 when codec_cut
+    changes its input width) are dropped the same way. Both leave those modules at
+    their fresh init, which is silent, so this prints them instead.
+    """
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = state_dict.get("state_dict", state_dict)
+    own = model.state_dict()
+    mismatched = [
+        k for k, v in state_dict.items()
+        if k in own and tuple(own[k].shape) != tuple(v.shape)
+    ]
+    for k in mismatched:
+        del state_dict[k]
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing = [k for k in missing if k not in mismatched]
+    for tag, keys in (
+        ("Missing", missing),
+        ("Unexpected", unexpected),
+        ("Shape-mismatched (left at init)", mismatched),
+    ):
+        if keys:
+            extra = f" (+{len(keys) - max_shown} more)" if len(keys) > max_shown else ""
+            print(cyan(
+                f"[ckpt] {tag} keys ({len(keys)}): "
+                f"{', '.join(keys[:max_shown])}{extra}"
+            ))
+
+
 @hydra.main(
     version_base=None,
     config_path="../config",
@@ -109,6 +141,8 @@ def train(cfg_dict: DictConfig):
         logger=logger,
         devices="auto",
         num_nodes=cfg.trainer.num_nodes,
+        # Plain "ddp": with the codec enabled DDP reported no unused parameters, so
+        # find_unused_parameters would only cost an extra autograd traversal per step.
         strategy="ddp" if torch.cuda.device_count() > 1 else "auto",
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
@@ -116,6 +150,7 @@ def train(cfg_dict: DictConfig):
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         max_steps=cfg.trainer.max_steps,
         num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
+        accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
@@ -131,14 +166,12 @@ def train(cfg_dict: DictConfig):
         "losses": get_losses(cfg.loss),
         "step_tracker": step_tracker,
     }
+    model_wrapper = ModelWrapper(**model_kwargs)
     if cfg.mode == "train" and checkpoint_path is not None and not cfg.checkpointing.resume:
         # Just load model weights, without optimizer states
         # e.g., fine-tune from the released weights on other datasets
-        model_wrapper = ModelWrapper.load_from_checkpoint(
-            checkpoint_path, **model_kwargs, strict=True)
+        load_checkpoint_weights(model_wrapper, checkpoint_path)
         print(cyan(f"Loaded weigths from {checkpoint_path}."))
-    else:
-        model_wrapper = ModelWrapper(**model_kwargs)
 
     data_module = DataModule(
         cfg.dataset,
@@ -151,6 +184,8 @@ def train(cfg_dict: DictConfig):
         trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=(
             checkpoint_path if cfg.checkpointing.resume else None))
     else:
+        if checkpoint_path is not None:
+            load_checkpoint_weights(model_wrapper, checkpoint_path)
         trainer.test(
             model_wrapper,
             datamodule=data_module,

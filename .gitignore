@@ -178,3 +178,42 @@ table.tex
 /test/*
 point_clouds*
 assets/*_3views.json
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# ---------------------------------------------------------------------------
+# Kept out of the shared MVSplat + feature-codec repo (local or cluster-only).
+# Comments must sit on their own line: a trailing "#" would become part of the pattern.
+
+# Separate progressive / scalable codec study
+/progressive/
+# SLURM logs: downloaded copies here, originals on the cluster
+/slurm/
+/logs/
+# TMPDIR of training jobs (checkpoint temp files)
+/tmp/
+# Local plots; only the final rate-distortion figure is shared
+/out/*
+!/out/rd_c50k_s50k_v2.png
+!/out/rd_c50k_s50k_v2.pdf
+# Released checkpoints are uploaded separately (see scripts/export_ckpts.py)
+/release/
+# Assistant session files
+/.claude/
+CLAUDE.md
+# Superseded notes: the zip bundles src/model/encoder/compression; the guide and the
+# diagram describe only the earlier A/B cuts, not the final C cut
+/mvsplat_codec.zip
+/mvsplat_codec_integration_guide.md
+/codec_architecture.svg
+# Debugging and cluster-housekeeping scripts, not needed to train or evaluate
+/scripts/probe_activations.py
+/scripts/probe_activations.slurm
+/scripts/ckpt_param_diff.py
+/scripts/cleanup_ckpts.sh
+# Codec files outside the mean-scale hyperprior path (nothing imports them), and the
+# stand-alone integration guide for an unmodified MVSplat checkout (A/B cuts only)
+/src/model/encoder/compression/importance_predictor.py
+/src/model/encoder/compression/similarity_metrics.py
+/src/model/encoder/compression/README.md

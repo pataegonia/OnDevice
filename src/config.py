@@ -34,6 +34,7 @@ class TrainerCfg:
     gradient_clip_val: int | float | None
     num_sanity_val_steps: int
     num_nodes: Optional[int] = 1
+    accumulate_grad_batches: int = 1
 
 
 @dataclass

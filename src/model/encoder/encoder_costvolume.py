@@ -58,6 +58,9 @@ class EncoderCostVolumeCfg:
     wo_backbone_cross_attn: bool
     wo_cost_volume_refine: bool
     use_epipolar_trans: bool
+    use_gauss_feature_compression: bool
+    codec_cut: Literal["pre_unet", "post_unet", "post_unet_skip"]
+    codec_igdn_max_gain: float | None = None
 
 
 class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
@@ -122,7 +125,30 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             wo_depth_refine=cfg.wo_depth_refine,
             wo_cost_volume=cfg.wo_cost_volume,
             wo_cost_volume_refine=cfg.wo_cost_volume_refine,
+            codec_cut=cfg.codec_cut,
         )
+
+        # Mean-scale hyperprior codec, applied to the full-resolution tensors that
+        # sit between the two halves of the depth predictor.
+        if cfg.use_gauss_feature_compression:
+            # Imported lazily so the uncompressed model still runs without compressai.
+            from .compression.compressor import MeanScaleHyperpriorBase
+
+            if cfg.codec_cut == "pre_unet":
+                # proj_feat ‖ RGB ‖ disparity ‖ confidence
+                in_channels = cfg.d_feature + 5
+            elif cfg.codec_cut == "post_unet":
+                # refine_out ‖ disparity
+                in_channels = cfg.depth_unet_feat_dim + 1
+            else:
+                # refine_out ‖ RGB ‖ proj_feat ‖ disparity
+                in_channels = cfg.depth_unet_feat_dim + 3 + cfg.d_feature + 1
+            self.gauss_feature_codec = MeanScaleHyperpriorBase(
+                in_channels=in_channels, N=192, M=320,
+                igdn_max_gain=cfg.codec_igdn_max_gain,
+            )
+        else:
+            self.gauss_feature_codec = None
 
     def map_pdf_to_opacity(
         self,
@@ -139,17 +165,13 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         # Map the probability density to an opacity.
         return 0.5 * (1 - (1 - pdf) ** exponent + pdf ** (1 / exponent))
 
-    def forward(
+    def _extract_features(
         self,
         context: dict,
-        global_step: int,
-        deterministic: bool = False,
-        visualization_dump: Optional[dict] = None,
-        scene_names: Optional[list] = None,
-    ) -> Gaussians:
-        device = context["image"].device
-        b, v, _, h, w = context["image"].shape
-
+        deterministic: bool,
+        scene_names: Optional[list],
+    ):
+        """Sender side: everything up to the cut in the depth predictor."""
         # Encode the context images.
         if self.cfg.use_epipolar_trans:
             epipolar_kwargs = {
@@ -174,18 +196,32 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         extra_info = {}
         extra_info['images'] = rearrange(context["image"], "b v c h w -> (v b) c h w")
         extra_info["scene_names"] = scene_names
-        gpp = self.cfg.gaussians_per_pixel
-        depths, densities, raw_gaussians = self.depth_predictor(
+        main, aux = self.depth_predictor(
             in_feats,
             context["intrinsics"],
             context["extrinsics"],
             context["near"],
             context["far"],
-            gaussians_per_pixel=gpp,
             deterministic=deterministic,
             extra_info=extra_info,
             cnn_features=cnn_features,
         )
+        return main, aux, tuple(in_feats.shape)
+
+    def _build_gaussians(
+        self,
+        extrinsics: Float[Tensor, "batch view 4 4"],
+        intrinsics: Float[Tensor, "batch view 3 3"],
+        depths: Tensor,
+        densities: Tensor,
+        raw_gaussians: Tensor,
+        global_step: int,
+        image_shape: tuple[int, int],
+        visualization_dump: Optional[dict] = None,
+    ) -> Gaussians:
+        """Receiver side: turn the depth predictor's output into Gaussians."""
+        h, w = image_shape
+        device = extrinsics.device
 
         # Convert the features and depths into Gaussians.
         xy_ray, _ = sample_image_grid((h, w), device)
@@ -200,8 +236,8 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
         gpp = self.cfg.gaussians_per_pixel
         gaussians = self.gaussian_adapter.forward(
-            rearrange(context["extrinsics"], "b v i j -> b v () () () i j"),
-            rearrange(context["intrinsics"], "b v i j -> b v () () () i j"),
+            rearrange(extrinsics, "b v i j -> b v () () () i j"),
+            rearrange(intrinsics, "b v i j -> b v () () () i j"),
             rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
             depths,
             self.map_pdf_to_opacity(densities, global_step) / gpp,
@@ -244,6 +280,126 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                 opacity_multiplier * gaussians.opacities,
                 "b v r srf spp -> b (v r srf spp)",
             ),
+        )
+
+    def forward(
+        self,
+        context: dict,
+        global_step: int,
+        deterministic: bool = False,
+        visualization_dump: Optional[dict] = None,
+        scene_names: Optional[list] = None,
+    ) -> dict:
+        _, _, _, h, w = context["image"].shape
+
+        main, aux, in_feats_shape = self._extract_features(
+            context, deterministic, scene_names
+        )
+
+        # Round-trip the full-resolution tensors through the codec. Rate is estimated
+        # differentiably here; no actual arithmetic coding happens.
+        estimated_bits = None
+        if self.gauss_feature_codec is not None:
+            c_main = main.shape[1]
+            c_aux = aux.shape[1]
+            codec_out = self.gauss_feature_codec(torch.cat((main, aux), dim=1))
+            main, aux = torch.split(codec_out["x_hat"], [c_main, c_aux], dim=1)
+            estimated_bits = codec_out["estimated_bits"]
+
+        depths, densities, raw_gaussians = self.depth_predictor.generate_raw_gaussians(
+            in_feats_shape,
+            main,
+            aux,
+            context["near"],
+            context["far"],
+            gaussians_per_pixel=self.cfg.gaussians_per_pixel,
+        )
+        densities = densities.clamp(0.0, 1.0)
+
+        gaussians = self._build_gaussians(
+            context["extrinsics"],
+            context["intrinsics"],
+            depths,
+            densities,
+            raw_gaussians,
+            global_step,
+            (h, w),
+            visualization_dump,
+        )
+        return {"gaussians": gaussians, "estimated_bits": estimated_bits}
+
+    def compress(
+        self,
+        context: dict,
+        global_step: int,
+        scene_names: Optional[list] = None,
+    ) -> dict:
+        """Sender side. The returned dict is exactly the keyword arguments of
+        `compression.ops.write_nfcgs_bitstream`."""
+        assert self.gauss_feature_codec is not None
+        _, _, _, h, w = context["image"].shape
+
+        main, aux, in_feats_shape = self._extract_features(
+            context, True, scene_names
+        )
+        feature_shape = (main.shape[1], aux.shape[1])
+        codec_out = self.gauss_feature_codec.compress(torch.cat((main, aux), dim=1))
+
+        return {
+            "codec_out": codec_out,
+            "extrinsics": context["extrinsics"],
+            "intrinsics": context["intrinsics"],
+            "near": context["near"],
+            "far": context["far"],
+            "feature_shape": feature_shape,
+            "infeature_shape": in_feats_shape,
+            "resolution": (h, w),
+            "global_step": global_step,
+        }
+
+    def decompress(
+        self,
+        codec_out: dict,
+        extrinsics: Float[Tensor, "batch view 4 4"],
+        intrinsics: Float[Tensor, "batch view 3 3"],
+        near: Float[Tensor, "batch view"],
+        far: Float[Tensor, "batch view"],
+        feature_shape: tuple[int, int],
+        infeature_shape: tuple[int, ...],
+        resolution: tuple[int, int],
+        global_step: int,
+        keep_ratio: float | None = None,
+        visualization_dump: Optional[dict] = None,
+    ) -> Gaussians:
+        """Receiver side. Takes what `compression.ops.read_nfcgs_bitstream` returns.
+
+        `keep_ratio` is accepted but unused: the keep-ratio conditioning is not ported.
+        """
+        assert self.gauss_feature_codec is not None
+        c_main, c_aux = feature_shape
+
+        decomp_out = self.gauss_feature_codec.decompress(**codec_out)
+        main, aux = torch.split(decomp_out["x_hat"], [c_main, c_aux], dim=1)
+
+        depths, densities, raw_gaussians = self.depth_predictor.generate_raw_gaussians(
+            infeature_shape,
+            main,
+            aux,
+            near,
+            far,
+            gaussians_per_pixel=self.cfg.gaussians_per_pixel,
+        )
+        densities = densities.clamp(0.0, 1.0)
+
+        return self._build_gaussians(
+            extrinsics,
+            intrinsics,
+            depths,
+            densities,
+            raw_gaussians,
+            global_step,
+            resolution,
+            visualization_dump,
         )
 
     def get_data_shim(self) -> DataShim:

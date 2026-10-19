@@ -144,12 +144,25 @@ class DepthPredictorMultiView(nn.Module):
         wo_depth_refine=False,
         wo_cost_volume=False,
         wo_cost_volume_refine=False,
+        codec_cut="pre_unet",
         **kwargs,
     ):
         super(DepthPredictorMultiView, self).__init__()
         self.num_depth_candidates = num_depth_candidates
         self.regressor_feat_dim = costvolume_unet_feat_dim
         self.upscale_factor = upscale_factor
+        # Where forward() hands over to generate_raw_gaussians(), i.e. where a codec
+        # can sit:
+        #   pre_unet        before the depth refinement U-Net
+        #   post_unet       after it; only refine_out ‖ disp crosses, so to_gaussians
+        #                   loses its RGB / proj_feat skip inputs
+        #   post_unet_skip  after it, but the skip inputs cross too, so the head is the
+        #                   original one and keeps its pretrained weights
+        assert codec_cut in ("pre_unet", "post_unet", "post_unet_skip"), codec_cut
+        assert not (codec_cut != "pre_unet" and wo_depth_refine), \
+            "post-U-Net cuts need the refine U-Net; pdf_max is not carried across"
+        self.codec_cut = codec_cut
+        self.feature_channels = feature_channels
         # ablation settings
         # Table 3: base
         self.wo_depth_refine = wo_depth_refine
@@ -240,7 +253,11 @@ class DepthPredictorMultiView(nn.Module):
             )
 
         # Gaussians prediction: covariance, color
-        gau_in = depth_unet_feat_dim + 3 + feature_channels
+        if codec_cut == "post_unet":
+            # Only refine_out crosses the cut, so the RGB / proj_feat skips are gone.
+            gau_in = depth_unet_feat_dim
+        else:
+            gau_in = depth_unet_feat_dim + 3 + feature_channels
         self.to_gaussians = nn.Sequential(
             nn.Conv2d(gau_in, gaussian_raw_channels * 2, 3, 1, 1),
             nn.GELU(),
@@ -266,7 +283,6 @@ class DepthPredictorMultiView(nn.Module):
         extrinsics,
         near,
         far,
-        gaussians_per_pixel=1,
         deterministic=True,
         extra_info=None,
         cnn_features=None,
@@ -345,15 +361,69 @@ class DepthPredictorMultiView(nn.Module):
 
         # depth refinement
         proj_feat_in_fullres = self.upsampler(torch.cat((feat01, cnn_features), dim=1))
+
+        # NOTE: the forward pass is cut here so that a codec can be inserted between
+        # the two halves. `generate_raw_gaussians` is the second half. The halves talk
+        # through a (main, aux) pair whose contents depend on self.codec_cut.
+        if self.codec_cut == "pre_unet":
+            aux = torch.cat((extra_info["images"], fullres_disps, pdf_max), dim=1)
+            return proj_feat_in_fullres, aux
+
         proj_feature = self.proj_feature(proj_feat_in_fullres)
         refine_out = self.refine_unet(torch.cat(
             (extra_info["images"], proj_feature, fullres_disps, pdf_max), dim=1
         ))
+        if self.codec_cut == "post_unet":
+            return refine_out, fullres_disps
+        aux = torch.cat((extra_info["images"], proj_feat_in_fullres, fullres_disps), dim=1)
+        return refine_out, aux
+
+    def generate_raw_gaussians(
+        self,
+        features_shape,
+        main,
+        aux,
+        near,
+        far,
+        gaussians_per_pixel=1,
+    ):
+        """Second half of the forward pass, split off so that (main, aux) can be
+        round-tripped through a codec first.
+
+        pre_unet:       main = proj_feat_in_fullres (128), aux = images ‖ disp ‖ pdf_max (5)
+        post_unet:      main = refine_out (depth_unet_feat_dim), aux = fullres_disps (1)
+        post_unet_skip: main = refine_out, aux = images ‖ proj_feat_in_fullres ‖ disp (3+128+1)
+        """
+
+        b, v, _, _, _ = features_shape
+
+        if self.codec_cut == "pre_unet":
+            proj_feat_in_fullres = main
+            # undo the channel-wise packing done at the end of forward()
+            images = aux[:, 0:3]
+            fullres_disps = aux[:, 3:4]
+            pdf_max = aux[:, 4:5]
+
+            proj_feature = self.proj_feature(proj_feat_in_fullres)
+            refine_out = self.refine_unet(torch.cat(
+                (images, proj_feature, fullres_disps, pdf_max), dim=1
+            ))
+            raw_gaussians_in = torch.cat(
+                [refine_out, images, proj_feat_in_fullres], dim=1
+            )
+        elif self.codec_cut == "post_unet":
+            refine_out, fullres_disps = main, aux
+            raw_gaussians_in = refine_out
+        else:
+            refine_out = main
+            images = aux[:, 0:3]
+            proj_feat_in_fullres = aux[:, 3:3 + self.feature_channels]
+            fullres_disps = aux[:, 3 + self.feature_channels:]
+            raw_gaussians_in = torch.cat(
+                [refine_out, images, proj_feat_in_fullres], dim=1
+            )
 
         # gaussians head
-        raw_gaussians_in = [refine_out,
-                            extra_info["images"], proj_feat_in_fullres]
-        raw_gaussians_in = torch.cat(raw_gaussians_in, dim=1)
         raw_gaussians = self.to_gaussians(raw_gaussians_in)
         raw_gaussians = rearrange(
             raw_gaussians, "(v b) c h w -> b v (h w) c", v=v, b=b

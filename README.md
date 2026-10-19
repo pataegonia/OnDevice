@@ -1,3 +1,151 @@
+# MVSplat + Feature Codec (Mean-Scale Hyperprior)
+
+MVSplat을 송신측과 수신측으로 나누고, 그 사이에서 오가는 중간 feature를 learned codec(Mean-Scale Hyperprior)으로 압축하는 버전입니다. 송신측은 context 이미지 2장에서 feature를 뽑아 bitstream 파일로 압축하고, 수신측은 그 파일만으로 3D Gaussian을 복원해 렌더링합니다.
+
+[MVSplat](https://github.com/donydchen/mvsplat)을 기반으로 합니다. 데이터셋 준비와 원본 모델 사용법은 아래쪽 [원본 MVSplat README](#원본-mvsplat-readme)를 따르세요.
+
+![RE10K rate-distortion](out/rd_c50k_s50k_v2.png)
+
+## 구조
+
+```text
+송신측  이미지 2장 → backbone → cost volume → Depth Refinement U-Net ─┐
+                                                                    절단 → g_a → 양자화 · entropy coding → bitstream 파일
+수신측  bitstream 파일 → entropy decoding → g_s → Gaussian head → Gaussian adapter → rasterizer
+```
+
+| 항목 | 내용 |
+| --- | --- |
+| 절단 위치 | Depth Refinement U-Net 직후 (`model.encoder.codec_cut=post_unet_skip`) |
+| 전송 텐서 (view당) | `refine_out(32) ‖ RGB(3) ‖ proj_feat(128) ‖ disp(1)` = 164 ch × 256 × 256 |
+| codec | compressai 기반 Mean-Scale Hyperprior (N=192, M=320), GDN/IGDN, wavelet aux transform (WLS/iWLS), IGDN gain 상한 10 |
+| Gaussian head | 원본 MVSplat 그대로라서 공개 `re10k.ckpt`의 가중치를 전부 불러오고, codec만 새로 학습합니다 |
+| bitstream 파일 | scene당 1개: view 2장의 y·z 스트림과 카메라·shape 헤더 |
+
+`codec_cut`으로 `pre_unet`(U-Net 직전, 133 ch)과 `post_unet`(U-Net 직후 `refine_out ‖ disp`만, 33 ch)도 고를 수 있습니다. 공개 checkpoint는 `post_unet_skip`뿐입니다.
+
+## 결과
+
+RE10K test set 6,474 scenes, context 2장(256×256), 50,000 step checkpoint입니다. scene마다 실제 bitstream 파일을 쓰고 그 파일만 읽어 복원한 뒤 측정했습니다.
+
+| λ | 파일 크기 / scene | raw 대비 | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2.388 | 2.54 KiB | 1/17,328 | 23.569 | 0.7739 | 0.2115 |
+| 0.597 | 5.55 KiB | 1/7,934 | 24.862 | 0.8289 | 0.1678 |
+| 0.1493 | 12.46 KiB | 1/3,534 | 25.758 | 0.8563 | 0.1426 |
+| 0.0373 | 24.49 KiB | 1/1,798 | 26.056 | 0.8638 | 0.1340 |
+| 0.0 | 461.26 KiB | 1/95 | 26.244 | 0.8672 | 0.1296 |
+| 압축 없음 (공개 MVSplat `re10k.ckpt`) | – | – | 26.387 | 0.8690 | 0.1284 |
+
+- raw는 Gaussian을 float32 그대로 보낼 때의 크기입니다: 2 view × 256×256개 × 86 값 × 4 B = 44,032 KiB.
+- λ=0은 rate 항이 없어서 entropy model이 학습되지 않습니다. 양자화만 했을 때의 화질 기준점으로 보면 됩니다.
+- 처리 시간 (평가 로그의 scene당 평균, 서버 GPU 1장): 송신 74–79 ms, 수신 86–91 ms입니다. 같은 환경에서 압축 없는 MVSplat의 encoder는 73 ms입니다. rasterize는 target view 1장당 2.5–3.1 ms로 따로 측정됩니다.
+
+## Checkpoint
+
+[Releases](https://github.com/pataegonia/OnDevice/releases)에 λ별로 5개가 있습니다.
+
+```text
+C50k_lmbda0.0_step50000.ckpt      C50k_lmbda0.0373_step50000.ckpt   C50k_lmbda0.1493_step50000.ckpt
+C50k_lmbda0.597_step50000.ckpt    C50k_lmbda2.388_step50000.ckpt    SHA256SUMS
+```
+
+optimizer 상태를 뺀 평가용 파일(각 124 MiB)이라 학습을 이어서 돌릴 수는 없습니다. `checkpoints/codec/`에 두면 아래 명령을 그대로 쓸 수 있습니다. 학습 checkpoint에서 이런 파일을 만드는 스크립트는 `scripts/export_ckpts.py`입니다.
+
+## 설치
+
+원본과 같습니다. `requirements.txt`에 `compressai==1.2.8`과 `pywavelets`가 추가되어 있습니다.
+
+```bash
+git clone https://github.com/pataegonia/OnDevice.git
+cd OnDevice
+conda create -n mvsplat python=3.10
+conda activate mvsplat
+pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+```
+
+RE10K 데이터는 원본 README의 [Acquiring Datasets](#acquiring-datasets)대로 `datasets/re10k`에 둡니다.
+
+## 평가
+
+```bash
+python -m src.main +experiment=re10k_codec \
+mode=test \
+dataset/view_sampler=evaluation \
+test.compute_scores=true \
+checkpointing.load=checkpoints/codec/C50k_lmbda0.0373_step50000.ckpt \
+model.encoder.codec_cut=post_unet_skip \
+model.encoder.codec_igdn_max_gain=10.0 \
+wandb.name=C50k_lmbda0.0373
+```
+
+- `re10k_codec` 설정은 `test.compress=true`라서, scene마다 bitstream을 `outputs/test/<wandb.name>/bitstream/<scene>.bin`에 쓰고 그 파일만 읽어 복원합니다.
+- 점수는 `outputs/test/<wandb.name>/scores_all_avg.json`과 stdout 끝(`psnr`, `ssim`, `lpips`, `bitstream_kib` 등)에 나옵니다.
+- `codec_cut`은 학습할 때와 같아야 합니다. 다르면 오류 없이 `to_gaussians.0`이 새로 초기화됩니다.
+- 렌더 이미지가 필요 없으면 `test.save_image=false`를 붙입니다.
+- SLURM에서는 `scripts/eval_codec.slurm`을 씁니다 (GPU 1장 전용):
+  `CODEC_CUT=post_unet_skip CKPT=<ckpt> RUN_NAME=<이름> DATA_ROOT=<re10k 경로> sbatch scripts/eval_codec.slurm model.encoder.codec_igdn_max_gain=10.0`
+- R-D 그림은 평가 로그로 `python scripts/plot_rd.py --logs <로그 폴더> --baseline-log <압축 없는 평가 로그>`를 실행해 그립니다.
+
+## 학습
+
+공개 MVSplat `re10k.ckpt`에서 시작해 codec을 붙여 fine-tune합니다. 원본 README의 [Training](#training) 절처럼 `checkpoints/`에 `re10k.ckpt`와 unimatch backbone(`gmdepth-scale1-resumeflowthings-scannet-5d9d7964.pth`)이 있어야 합니다.
+
+SLURM (GPU 1장, batch 2 × accumulation 32 = 유효 batch 64, 50,000 step):
+
+```bash
+TOTAL_SAMPLES=3200000 CODEC_CUT=post_unet_skip LMBDA=0.0373 RUN_NAME=C50k_lmbda0.0373 \
+sbatch scripts/train_codec.slurm \
+optimizer.cosine_lr=true optimizer.lr=0.0001 model.encoder.codec_igdn_max_gain=10.0
+```
+
+SLURM 없이 같은 설정으로 돌리려면:
+
+```bash
+python -m src.main +experiment=re10k_codec \
+checkpointing.load=checkpoints/re10k.ckpt \
+checkpointing.resume=false \
+checkpointing.every_n_train_steps=2000 \
+output_dir=outputs/codec/C50k_lmbda0.0373 \
+model.encoder.codec_cut=post_unet_skip \
+train.lmbda=0.0373 \
+optimizer.cosine_lr=true \
+optimizer.lr=0.0001 \
+model.encoder.codec_igdn_max_gain=10.0 \
+data_loader.train.batch_size=2 \
+trainer.accumulate_grad_batches=32 \
+trainer.max_steps=50000 \
+dataset.view_sampler.warm_up_steps=25000
+```
+
+- R-D 곡선의 점마다 λ를 바꿔 따로 학습합니다: 0.0 / 0.0373 / 0.1493 / 0.597 / 2.388. rate 항은 추정 bit 수를 (Gaussian 수 × 86)으로 나눈 값이라 이미지 bpp와는 다릅니다.
+- `optimizer.cosine_lr=true optimizer.lr=0.0001`을 꼭 넘깁니다. `re10k_codec.yaml` 기본값(최고 lr 2e-4, warm-up 뒤 일정)으로는 6k–15k step 사이에서 학습이 발산했습니다.
+- `train.skip_loss_above: 1.0`이 기본으로 켜져 있어 loss가 1을 넘는 batch는 건너뛰고, 64번 연속이면 학습을 멈춥니다.
+- float 설정은 소수점을 넣어 씁니다 (`train.lmbda=0.0`, `codec_igdn_max_gain=10.0`). `0`이나 `10`처럼 정수로 쓰면 config 로더가 거부합니다.
+- 이어서 학습할 때는 `RESUME=true CKPT=<마지막 학습 checkpoint> RUN_NAME=<새 이름>`을 더하고, `TOTAL_SAMPLES`와 뒤쪽 override를 처음과 똑같이 넘깁니다. 재개하면 저장된 lr 스케줄을 config의 `optimizer.lr`에 맞춰 다시 조정하므로, override를 빠뜨리면 lr이 바뀝니다. 로그에 `resume: lr schedule rescaled by 1`이 찍히면 정상입니다.
+
+### 공개 checkpoint의 학습 경과
+
+- 다섯 개 모두 위 레시피로 0 step부터 학습했고, 중간에 여러 번 재개해 50,000 step을 채웠습니다. GPU는 1–2장을 썼고 유효 batch는 64로 같습니다.
+- 마지막 재개 구간(38,000 → 50,000 step, λ2.388은 36,000 → 50,000 step)은 `optimizer.lr` 없이 실행되었습니다. 그래서 로그에 `resume: lr schedule rescaled by 2 to peak 0.0002`가 찍혔고, 이 구간은 재개 시점의 lr이 계획의 2배로 맞춰진 채 학습되었습니다. 이 구간에서 건너뛴 batch는 없습니다.
+
+## 바뀐 파일
+
+| 파일 | 내용 |
+| --- | --- |
+| `src/model/encoder/compression/` | codec 본체: `compressor.py`(MeanScaleHyperpriorBase), `ops.py`(GDN, 양자화, bitstream 파일 쓰기/읽기), `auxt.py`(WLS/iWLS), `pywave.py`(DWT/IDWT) |
+| `src/model/encoder/costvolume/depth_predictor_multiview.py` | depth predictor를 송신 부분(`forward`)과 수신 부분(`generate_raw_gaussians`)으로 나누고, `codec_cut`에 따라 전송 텐서를 정함 |
+| `src/model/encoder/encoder_costvolume.py` | 두 부분 사이에 codec을 넣음. 학습용 forward와 실제 압축용 `compress` / `decompress` |
+| `src/model/model_wrapper.py` | rate 항(`train.lmbda`), 실제 bitstream 평가(`test.compress`), loss spike guard, 재개 시 lr 스케줄 조정 |
+| `src/main.py` | checkpoint를 불러올 때 shape이 다른 key는 버리고 목록을 출력 |
+| `config/experiment/re10k_codec.yaml`, `config/main.yaml`, `config/model/encoder/costvolume.yaml` | codec 설정과 기본값 |
+| `scripts/` | 학습/평가 SLURM 스크립트, checkpoint별 평가 sweep(`eval_sweep.slurm`, `summarize_sweep.py`), R-D 그림(`plot_rd.py`), 배포용 checkpoint 만들기(`export_ckpts.py`) |
+
+---
+
+## 원본 MVSplat README
+
 <p align="center">
   <h1 align="center">MVSplat: Efficient 3D Gaussian Splatting <br> from Sparse Multi-View Images</h1>
   <p align="center">

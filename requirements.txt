@@ -24,3 +24,7 @@ tabulate
 svg.py
 opencv-python==4.6.0.66
 sk-video
+# src/model/encoder/compression: entropy models + rANS bitstream
+compressai==1.2.8
+# src/model/encoder/compression/pywave.py: haar filters for the AuxT wavelet shortcut
+pywavelets

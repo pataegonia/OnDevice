@@ -4,7 +4,6 @@ from typing import Generic, TypeVar
 from torch import nn
 
 from ...dataset.types import BatchedViews, DataShim
-from ..types import Gaussians
 
 T = TypeVar("T")
 
@@ -21,7 +20,8 @@ class Encoder(nn.Module, ABC, Generic[T]):
         self,
         context: BatchedViews,
         deterministic: bool,
-    ) -> Gaussians:
+    ) -> dict:
+        """Returns {"gaussians": Gaussians, "estimated_bits": dict | None}."""
         pass
 
     def get_data_shim(self) -> DataShim:
