@@ -128,7 +128,8 @@ dataset.view_sampler.warm_up_steps=25000
 ### 공개 checkpoint의 학습 경과
 
 - 다섯 개 모두 위 레시피로 0 step부터 학습했고, 중간에 여러 번 재개해 50,000 step을 채웠습니다. GPU는 1–2장을 썼고 유효 batch는 64로 같습니다.
-- 마지막 재개 구간(38,000 → 50,000 step, λ2.388은 36,000 → 50,000 step)은 `optimizer.lr` 없이 실행되었습니다. 그래서 로그에 `resume: lr schedule rescaled by 2 to peak 0.0002`가 찍혔고, 이 구간은 재개 시점의 lr이 계획의 2배로 맞춰진 채 학습되었습니다. 이 구간에서 건너뛴 batch는 없습니다.
+- 마지막 재개 구간(38,000 → 50,000 step, λ2.388은 36,000 → 50,000 step)은 `optimizer.cosine_lr=true optimizer.lr=0.0001` 없이 실행되었습니다. 그래서 cosine 감소 대신 warm-up 뒤 일정한 스케줄이 걸렸고, lr은 재개 시점 값의 2배인 2.77e-5(λ2.388은 3.70e-5)로 50,000 step까지 고정되었습니다(로그 `resume: lr schedule rescaled by 2 to peak 0.0002`, 50k checkpoint의 optimizer lr로 확인). 계획대로였다면 이 구간의 lr은 1.38e-5(λ2.388은 1.85e-5)에서 0 가까이로 줄어야 했습니다. 이 구간에서 건너뛴 batch는 없습니다.
+- 같은 명령줄에 있던 `model.encoder.codec_igdn_max_gain=10.0`이 이 구간에 적용됐는지는 확인하지 못했습니다. 이 설정은 checkpoint에 흔적을 남기지 않습니다.
 
 ## 바뀐 파일
 
