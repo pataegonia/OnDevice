@@ -22,7 +22,7 @@ e3nn
 plyfile
 tabulate
 svg.py
-opencv-python==4.6.0.66
+opencv-python==4.8.1.78
 sk-video
 # src/model/encoder/compression: entropy models + rANS bitstream
 compressai==1.2.8
